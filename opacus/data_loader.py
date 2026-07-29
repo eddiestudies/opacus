@@ -13,6 +13,7 @@
 # limitations under the License.
 import copy
 import logging
+from collections.abc import Sized
 from typing import Any, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
 import torch
@@ -343,6 +344,17 @@ class DPDataLoader(DataLoader):
 
         if isinstance(data_loader.dataset, IterableDataset):
             raise ValueError("Uniform sampling is not supported for IterableDataset")
+
+        sampler = data_loader.sampler
+        if (
+            not distributed
+            and isinstance(sampler, Sized)
+            and len(sampler) != len(data_loader.dataset)
+        ):
+            raise ValueError(
+                f"Can't estimate sample rate: sampler iterates over {len(sampler)} "
+                f"samples per epoch, but the dataset contains {len(data_loader.dataset)}."
+            )
 
         return cls(
             dataset=data_loader.dataset,
