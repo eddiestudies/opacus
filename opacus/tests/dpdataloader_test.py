@@ -16,7 +16,7 @@ import unittest
 
 import torch
 from opacus.data_loader import CollateFnWithEmpty, DPDataLoader, wrap_collate_with_empty
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 from torch.utils.data._utils.collate import default_collate
 
 
@@ -120,6 +120,29 @@ class DPDataLoaderTest(unittest.TestCase):
         dataset = TensorDataset(x)
         data_loader = DataLoader(dataset, drop_last=True)
         _ = DPDataLoader.from_data_loader(data_loader)
+
+    def test_partial_coverage_sampler_raises(self) -> None:
+        """
+        Test that sampler not covering the full sataset are rejected,
+        as they would lead to incorrect sample rate and privacy accounting
+        """
+        x = torch.randn(self.data_size, self.dimension)
+
+        dataset = TensorDataset(x)
+        sampler = WeightedRandomSampler(
+            weights=torch.ones(self.data_size), num_samples=4, replacement=True
+        )
+        data_loader = DataLoader(dataset, batch_size=2, sampler=sampler)
+        with self.assertRaisesRegex(ValueError, "sample rate"):
+            DPDataLoader.from_data_loader(data_loader)
+
+    def test_full_coverage_sampler_accepted(self) -> None:
+        x = torch.randn(self.data_size, self.dimension)
+
+        dataset = TensorDataset(x)
+        data_loader = DataLoader(dataset, batch_size=2, shuffle=True)
+        dp_data_loader = DPDataLoader.from_data_loader(data_loader)
+        self.assertAlmostEqual(dp_data_loader.sample_rate, 0.2)
 
 
 class CollateFnWithEmptyTest(unittest.TestCase):

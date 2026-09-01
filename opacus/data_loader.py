@@ -13,6 +13,7 @@
 # limitations under the License.
 import copy
 import logging
+from collections.abc import Sized
 from typing import Any, List, Mapping, Optional, Sequence, Tuple, Type, Union
 
 import torch
@@ -343,6 +344,22 @@ class DPDataLoader(DataLoader):
 
         if isinstance(data_loader.dataset, IterableDataset):
             raise ValueError("Uniform sampling is not supported for IterableDataset")
+
+        sampler = data_loader.sampler
+        if (
+            not distributed
+            and isinstance(sampler, Sized)
+            and len(sampler) != len(data_loader.dataset)
+        ):
+            raise ValueError(
+                f"Can't estimate sample rate: data loader's sampler iterates over "
+                f"{len(sampler)} samples per epoch, while the dataset contains "
+                f"{len(data_loader.dataset)}. Samplers that don't cover the full "
+                f"dataset once per epoch (e.g. WeightedRandomSampler) are "
+                f"not compatible with Poisson sampling and would result in "
+                f"incorrect privacy accounting. Remove the custom sampler or "
+                f"disable Poisson sampling."
+            )
 
         return cls(
             dataset=data_loader.dataset,
