@@ -231,6 +231,10 @@ class DPLossFastGradientClipping:
             == optimizer.loss_reduction
         ), "loss_reduction should be the same across GradSampleModule, Optimizer, Criterion, and loss_reduction"
 
+        # clip with optimizer.max_grad_norm so that schedulers update both
+        if isinstance(module, GradSampleHooksFastGradientClipping):
+            module.attach_clip_bound_owner(optimizer)
+
         self.optimizer = optimizer
         self.module = module
         self.criterion = criterion

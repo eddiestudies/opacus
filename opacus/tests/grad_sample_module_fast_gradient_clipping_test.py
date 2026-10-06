@@ -16,6 +16,7 @@
 import copy
 import logging
 import unittest
+import warnings
 from unittest.mock import MagicMock
 
 import hypothesis.strategies as st
@@ -23,14 +24,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from hypothesis import given, settings
+from opacus import PrivacyEngine
 from opacus.grad_sample import GradSampleModule, GradSampleModuleFastGradientClipping
 from opacus.optimizers import DPOptimizer, DPOptimizerFastGradientClipping
+from opacus.schedulers import ExponentialGradClip
 from opacus.utils.fast_gradient_clipping_utils import (
     DPLossFastGradientClipping,
     DPTensorFastGradientClipping,
 )
 from opacus.utils.per_sample_gradients_utils import clone_module
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 from .grad_sample_module_test import GradSampleModuleTest, SampleConvNet
 
@@ -166,7 +169,7 @@ class GradSampleModuleFastGradientClippingTest(GradSampleModuleTest):
             loss_reduction="mean",
         )
 
-        (input_data, target_data) = list(self.dl)[0]
+        input_data, target_data = list(self.dl)[0]
         optimizer_normal.zero_grad()
         output_normal = self.model_normal(input_data)
         loss_normal = self.criterion(output_normal, target_data)
@@ -248,7 +251,7 @@ class GradSampleModuleFastGradientClippingTest(GradSampleModuleTest):
             self.grad_sample_module, optimizer_gc, copy.deepcopy(self.criterion)
         )
 
-        (input_data, target_data) = list(self.dl)[0]
+        input_data, target_data = list(self.dl)[0]
         optimizer_normal.zero_grad()
         output_normal = self.model_normal(input_data)
         loss_normal = torch.mean(self.criterion(output_normal, target_data), dim=0)
@@ -599,3 +602,131 @@ class DPTensorArithmeticTest(unittest.TestCase):
             self.module, self.optimizer, self.loss_per_sample, loss_reduction="sum"
         )
         self.assertAlmostEqual(dp_sum.item(), 6.0)
+
+
+class GhostClippingSchedulerTest(unittest.TestCase):
+    """
+    Ghost clipping clips in the module and adds noise in the optimizer, so both
+    must use the same ``max_grad_norm`` after a ``GradClipScheduler`` step.
+    """
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.data = torch.randn(4, 8) * 10
+        self.labels = torch.randint(0, 3, (4,))
+        self.max_grad_norm = 1.0
+        self.gamma = 0.1
+
+    def _make_private(self, wrap_model=True):
+        model = nn.Sequential(nn.Linear(8, 6), nn.Tanh(), nn.Linear(6, 3))
+        dp_model, optimizer, criterion, _ = PrivacyEngine().make_private(
+            module=model,
+            optimizer=torch.optim.SGD(model.parameters(), lr=0.0),
+            data_loader=DataLoader(TensorDataset(self.data, self.labels), batch_size=4),
+            criterion=nn.CrossEntropyLoss(reduction="sum"),
+            noise_multiplier=0.0,
+            max_grad_norm=self.max_grad_norm,
+            poisson_sampling=False,
+            grad_sample_mode="ghost",
+            loss_reduction="sum",
+            wrap_model=wrap_model,
+        )
+        return model, dp_model, optimizer, criterion
+
+    def test_scheduler_updates_clipping_bound(self):
+        for wrap_model in (True, False):
+            with self.subTest(wrap_model=wrap_model):
+                model, _, optimizer, criterion = self._make_private(wrap_model)
+                scheduler = ExponentialGradClip(optimizer, gamma=self.gamma)
+                scheduler.step()
+
+                optimizer.zero_grad()
+                loss = criterion(model(self.data[:1]), self.labels[:1])
+                loss.backward()
+                optimizer.step()
+
+                # no noise and sum reduction: the gradient is the clipped one
+                grad_norm = torch.sqrt(sum((p.grad**2).sum() for p in optimizer.params))
+                self.assertAlmostEqual(
+                    grad_norm.item(), self.max_grad_norm * self.gamma, places=4
+                )
+
+    def test_get_clipping_coef_after_scheduler_step(self):
+        _, dp_model, optimizer, _ = self._make_private()
+        ExponentialGradClip(optimizer, gamma=self.gamma).step()
+        self.assertAlmostEqual(dp_model.max_grad_norm, self.max_grad_norm * self.gamma)
+
+        loss = F.cross_entropy(dp_model(self.data), self.labels, reduction="sum")
+        loss.backward()
+        expected = (dp_model.max_grad_norm / (dp_model.get_norm_sample() + 1e-6)).clamp(
+            max=1.0
+        )
+        self.assertTrue(torch.allclose(dp_model.get_clipping_coef(), expected))
+
+    def test_set_max_grad_norm_updates_optimizer(self):
+        _, dp_model, optimizer, _ = self._make_private()
+        dp_model.max_grad_norm = 0.5
+        self.assertEqual(optimizer.max_grad_norm, 0.5)
+
+    def test_max_grad_norm_without_optimizer(self):
+        gsm = GradSampleModuleFastGradientClipping(
+            nn.Linear(4, 2), max_grad_norm=2.0, loss_reduction="sum"
+        )
+        self.assertEqual(gsm.max_grad_norm, 2.0)
+        gsm.max_grad_norm = 3.0
+        self.assertEqual(gsm.max_grad_norm, 3.0)
+
+    def _make_direct(self, module_bound, optimizer_bound):
+        model = nn.Sequential(nn.Linear(8, 6), nn.Tanh(), nn.Linear(6, 3))
+        gsm = GradSampleModuleFastGradientClipping(
+            model, max_grad_norm=module_bound, loss_reduction="sum"
+        )
+        optimizer = DPOptimizerFastGradientClipping(
+            torch.optim.SGD(gsm.parameters(), lr=0.0),
+            noise_multiplier=0.0,
+            max_grad_norm=optimizer_bound,
+            expected_batch_size=1,
+            loss_reduction="sum",
+        )
+        return gsm, optimizer
+
+    def test_scheduler_updates_clipping_bound_without_privacy_engine(self):
+        gsm, optimizer = self._make_direct(self.max_grad_norm, self.max_grad_norm)
+        criterion = DPLossFastGradientClipping(
+            gsm, optimizer, nn.CrossEntropyLoss(reduction="sum"), loss_reduction="sum"
+        )
+        ExponentialGradClip(optimizer, gamma=self.gamma).step()
+
+        optimizer.zero_grad()
+        loss = criterion(gsm(self.data[:1]), self.labels[:1])
+        loss.backward()
+        optimizer.step()
+
+        grad_norm = torch.sqrt(sum((p.grad**2).sum() for p in optimizer.params))
+        self.assertAlmostEqual(
+            grad_norm.item(), self.max_grad_norm * self.gamma, places=4
+        )
+
+    def test_attach_uses_optimizer_bound(self):
+        gsm, optimizer = self._make_direct(module_bound=0.5, optimizer_bound=2.0)
+        with self.assertWarnsRegex(UserWarning, "max_grad_norm differs"):
+            gsm.attach_clip_bound_owner(optimizer)
+        self.assertEqual(optimizer.max_grad_norm, 2.0)
+        self.assertEqual(gsm.max_grad_norm, 2.0)
+
+    def test_scheduler_step_before_criterion_is_kept(self):
+        gsm, optimizer = self._make_direct(self.max_grad_norm, self.max_grad_norm)
+        ExponentialGradClip(optimizer, gamma=self.gamma).step()
+        with self.assertWarnsRegex(UserWarning, "max_grad_norm differs"):
+            DPLossFastGradientClipping(
+                gsm, optimizer, nn.CrossEntropyLoss(reduction="sum"), "sum"
+            )
+        self.assertAlmostEqual(gsm.max_grad_norm, self.max_grad_norm * self.gamma)
+        self.assertAlmostEqual(optimizer.max_grad_norm, self.max_grad_norm * self.gamma)
+
+    def test_attach_matching_bounds_does_not_warn(self):
+        gsm, optimizer = self._make_direct(self.max_grad_norm, self.max_grad_norm)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            gsm.attach_clip_bound_owner(optimizer)
+        self.assertIs(gsm._clip_bound_owner, optimizer)

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import List
 
 import torch
@@ -130,9 +131,48 @@ class GradSampleHooksFastGradientClipping(GradSampleHooks):
             force_functorch=force_functorch,
         )
         self.trainable_parameters = [p for _, p in trainable_parameters(self._module)]
+        # set by attach_clip_bound_owner() so that the optimizer owns max_grad_norm
+        self._clip_bound_owner = None
         self.max_grad_norm = max_grad_norm
         self.use_ghost_clipping = use_ghost_clipping
         self._per_sample_gradient_norms = None
+
+    @property
+    def max_grad_norm(self) -> float:
+        """
+        The value at which gradients are clipped. Read from the attached optimizer,
+        if any, so that schedulers updating ``optimizer.max_grad_norm`` (e.g.
+        ``GradClipScheduler``) also update the clipping bound.
+        """
+        owner = self._clip_bound_owner
+        return owner.max_grad_norm if owner is not None else self._max_grad_norm
+
+    @max_grad_norm.setter
+    def max_grad_norm(self, value: float):
+        if self._clip_bound_owner is not None:
+            self._clip_bound_owner.max_grad_norm = value
+        else:
+            self._max_grad_norm = value
+
+    def attach_clip_bound_owner(self, owner) -> None:
+        """
+        Read and write ``max_grad_norm`` through ``owner`` (the DP optimizer), so that
+        the clipping bound and the noise scale always agree.
+
+        ``owner.max_grad_norm`` is used from now on and the module's own value is
+        ignored. A warning is raised if the two differ.
+
+        Args:
+            owner: object exposing a ``max_grad_norm`` attribute, usually
+                the ``DPOptimizerFastGradientClipping`` used for training
+        """
+        if owner.max_grad_norm != self.max_grad_norm:
+            warnings.warn(
+                f"max_grad_norm differs between the module ({self.max_grad_norm}) "
+                f"and the optimizer ({owner.max_grad_norm}). Clipping with the "
+                f"optimizer's max_grad_norm."
+            )
+        self._clip_bound_owner = owner
 
     def get_clipping_coef(self) -> torch.Tensor:
         """Get per-example gradient scaling factor for clipping."""
